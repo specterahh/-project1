@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,6 +23,7 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "telecom_ops.db"
 PORT = 8765
+QUERY_TIMEOUT_SECONDS = 3.0
 
 SCHEMA = """
 customers(customer_id, customer_no, full_name, id_card_no, gender, birth_date, phone_no, email, city_code, city_name, district_name, address, customer_level, status, referrer_customer_id, register_time, cancel_time, credit_score, profile_json, is_test_user, updated_at)
@@ -31,6 +33,19 @@ usage_records(usage_id, subscription_id, customer_id, caller_msisdn, usage_time,
 bills(bill_id, bill_no, customer_id, subscription_id, bill_month, plan_fee, voice_fee, data_fee, sms_fee, value_added_fee, discount_amount, adjust_amount, total_amount, paid_amount, unpaid_amount, bill_status, issue_time, due_time, pay_time, pay_channel, invoice_no, city_code, remark, fee_detail_json)
 tickets(ticket_id, ticket_no, customer_id, subscription_id, parent_ticket_id, related_bill_id, category, sub_category, priority, status, channel, title, description, city_code, city_name, created_time, first_response_time, closed_time, sla_hours, is_escalated, satisfaction_score, handler_id, tags_json)
 """.strip()
+
+ALLOWED_COLUMNS = {}
+for _line in SCHEMA.splitlines():
+    _name, _cols = _line.split("(", 1)
+    ALLOWED_COLUMNS[_name.strip()] = {col.strip() for col in _cols.rstrip(")").split(",")}
+
+ALLOWED_FUNCTIONS = {
+    "count", "sum", "avg", "max", "min", "total", "group_concat",
+    "substr", "substring", "datetime", "date", "time", "strftime", "julianday",
+    "length", "lower", "upper", "trim", "ltrim", "rtrim",
+    "abs", "round", "coalesce", "nullif", "ifnull", "iif", "typeof",
+    "printf", "replace", "instr", "cast",
+}
 
 SYSTEM = (
     "你是 SQLite 助手。只输出一条 SQL，不要解释，不要 Markdown。"
@@ -137,16 +152,47 @@ def describe(sql: str, table: str) -> dict:
     }
 
 
+def authorizer(action, arg1, arg2, _dbname, _source):
+    if action == sqlite3.SQLITE_SELECT:
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_READ:
+        columns = ALLOWED_COLUMNS.get((arg1 or "").lower())
+        if columns is not None and (arg2 or "").lower() in columns:
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_FUNCTION:
+        if (arg2 or "").lower() in ALLOWED_FUNCTIONS:
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_DENY
+
+
+def open_db():
+    conn = sqlite3.connect(DB_PATH.as_uri() + "?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = ON")
+    conn.set_authorizer(authorizer)
+    return conn
+
+
 def run_select(sql: str) -> dict:
+    """生成 SQL 和历史记录重查都只走这里。"""
     checked = validate_sql(sql)
     if not checked["ok"]:
         return checked
     if not DB_PATH.is_file():
         return {"ok": False, "error": "同一文件夹里没有 telecom_ops.db", "sql": checked["sql"]}
     wrapped = f"SELECT * FROM ({checked['sql']}) AS q LIMIT 200"
+    started = time.monotonic()
+
+    def progress():
+        if time.monotonic() - started > QUERY_TIMEOUT_SECONDS:
+            return 1
+        return 0
+
     try:
-        conn = sqlite3.connect(DB_PATH.as_uri() + "?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
+        conn = open_db()
+        conn.set_progress_handler(progress, 10000)
         try:
             cur = conn.execute(wrapped)
             columns = [item[0] for item in cur.description]
@@ -161,7 +207,12 @@ def run_select(sql: str) -> dict:
                 rows.append(cells)
         finally:
             conn.close()
-    except sqlite3.Error as exc:
+    except sqlite3.DatabaseError as exc:
+        text = str(exc).lower()
+        if "not authorized" in text or "prohibited" in text:
+            return {"ok": False, "error": "这条语句读到了不允许的表或列，或者试图改数据", "sql": checked["sql"]}
+        if "interrupt" in text:
+            return {"ok": False, "error": "查询超过 3 秒，已中止", "sql": checked["sql"]}
         return {"ok": False, "error": f"SQL 没能执行：{exc}", "sql": checked["sql"]}
     return {
         "ok": True,
@@ -268,7 +319,7 @@ PAGE = r"""<!DOCTYPE html>
       </select>
       <label for="model">模型名，留空就用默认</label>
       <input id="model" placeholder="deepseek-chat">
-      <label for="key">接口密钥，只留在这台浏览器</label>
+      <label for="key">接口密钥，只在当前这次打开时有效</label>
       <input id="key" type="password" placeholder="粘贴密钥" autocomplete="off">
       <label for="question">问题</label>
       <textarea id="question" rows="5" placeholder="例如：杭州还有多少在网的人"></textarea>
@@ -298,9 +349,10 @@ const go = document.getElementById("go");
 let history = [];
 let active = null;
 try { history = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]"); } catch (e) { history = []; }
+localStorage.removeItem("telecom_ops_qa_key");
 document.getElementById("provider").value = localStorage.getItem("telecom_ops_qa_provider") || "deepseek";
 document.getElementById("model").value = localStorage.getItem("telecom_ops_qa_model") || "";
-document.getElementById("key").value = localStorage.getItem("telecom_ops_qa_key") || "";
+document.getElementById("key").value = sessionStorage.getItem("telecom_ops_qa_key") || "";
 EXAMPLES.forEach((text) => {
   const button = document.createElement("button");
   button.type = "button";
@@ -312,7 +364,7 @@ EXAMPLES.forEach((text) => {
 function saveSettings() {
   localStorage.setItem("telecom_ops_qa_provider", document.getElementById("provider").value);
   localStorage.setItem("telecom_ops_qa_model", document.getElementById("model").value);
-  localStorage.setItem("telecom_ops_qa_key", document.getElementById("key").value);
+  sessionStorage.setItem("telecom_ops_qa_key", document.getElementById("key").value);
 }
 function persist() {
   history = history.slice(0, 12);
